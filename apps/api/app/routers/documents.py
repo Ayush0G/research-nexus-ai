@@ -5,13 +5,14 @@ from uuid import uuid4
 from fastapi import APIRouter, UploadFile, File, HTTPException
 
 from ..services.extraction_service import extract_pdf, extract_markdown
+from ..services.entity_service import extract_entities
+from ..services.relationship_service import extract_relationships
 
 router = APIRouter(prefix="/api/documents", tags=["documents"])
 
 ALLOWED_TYPES = {"application/pdf", "text/markdown", "text/x-markdown"}
-MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
+MAX_FILE_SIZE = 50 * 1024 * 1024
 
-# In-memory store for demo (no DB required)
 documents_db: dict[str, dict] = {}
 
 
@@ -50,12 +51,20 @@ async def upload_document(file: UploadFile = File(...)):
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
 
+    # Extract entities
+    entities = extract_entities(raw_content)
+
+    # Extract relationships
+    relationships = extract_relationships(raw_content, entities)
+
     doc = {
         "id": doc_id,
         "title": file.filename or "Untitled",
         "source_type": source_type,
         "status": "completed",
         "raw_content": raw_content,
+        "entities": entities,
+        "relationships": relationships,
         "created_at": "2026-01-01T00:00:00",
         "processed_at": "2026-01-01T00:00:00",
     }
@@ -71,19 +80,17 @@ async def add_repository(body: dict):
         raise HTTPException(status_code=400, detail="repository_url is required")
 
     doc_id = str(uuid4())
-    doc = {
-        "document_id": doc_id,
-        "status": "queued",
-    }
     documents_db[doc_id] = {
         "id": doc_id,
         "title": repo_url.split("/")[-1],
         "source_type": "repository",
         "status": "queued",
         "raw_content": None,
+        "entities": [],
+        "relationships": [],
     }
 
-    return doc
+    return {"document_id": doc_id, "status": "queued"}
 
 
 @router.get("/{document_id}/status")

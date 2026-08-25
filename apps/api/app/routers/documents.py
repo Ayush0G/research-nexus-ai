@@ -3,6 +3,7 @@ import tempfile
 from uuid import uuid4
 
 from fastapi import APIRouter, UploadFile, File, HTTPException
+from pydantic import BaseModel, field_validator
 
 from ..services.extraction_service import extract_pdf, extract_markdown
 from ..services.entity_service import extract_entities
@@ -10,51 +11,69 @@ from ..services.relationship_service import extract_relationships
 
 router = APIRouter(prefix="/api/documents", tags=["documents"])
 
-ALLOWED_TYPES = {"application/pdf", "text/markdown", "text/x-markdown"}
-MAX_FILE_SIZE = 50 * 1024 * 1024
+ALLOWED_EXTENSIONS = {".pdf", ".md", ".markdown"}
+ALLOWED_MIME_TYPES = {"application/pdf", "text/markdown", "text/x-markdown"}
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
 
 documents_db: dict[str, dict] = {}
 
 
-@router.post("/upload")
-async def upload_document(file: UploadFile = File(...)):
-    if file.content_type not in ALLOWED_TYPES:
+def _validate_file(file: UploadFile, contents: bytes):
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Filename is required.")
+
+    ext = os.path.splitext(file.filename)[1].lower()
+    if ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported file type: {file.content_type}. Use PDF or Markdown.",
+            detail=f"Invalid file type '{ext}'. Allowed: PDF, Markdown.",
         )
 
-    contents = await file.read()
+    if file.content_type and file.content_type not in ALLOWED_MIME_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid MIME type '{file.content_type}'. Allowed: application/pdf, text/markdown.",
+        )
+
     if len(contents) == 0:
         raise HTTPException(status_code=400, detail="File is empty.")
+
     if len(contents) > MAX_FILE_SIZE:
-        raise HTTPException(status_code=400, detail="File exceeds 50MB limit.")
+        raise HTTPException(
+            status_code=400,
+            detail=f"File exceeds 10MB limit. Received: {len(contents) / 1024 / 1024:.1f}MB",
+        )
+
+
+@router.post("/upload")
+async def upload_document(file: UploadFile = File(...)):
+    contents = await file.read()
+    _validate_file(file, contents)
 
     doc_id = str(uuid4())
-    source_type = "pdf" if file.content_type == "application/pdf" else "markdown"
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    source_type = "pdf" if ext == ".pdf" else "markdown"
 
-    with tempfile.NamedTemporaryFile(
-        delete=False, suffix=os.path.splitext(file.filename or "")[1]
-    ) as tmp:
-        tmp.write(contents)
-        tmp_path = tmp.name
+    tmp_dir = tempfile.mkdtemp()
+    tmp_path = os.path.join(tmp_dir, f"upload{ext}")
 
     try:
+        with open(tmp_path, "wb") as f:
+            f.write(contents)
+
         if source_type == "pdf":
             raw_content = extract_pdf(tmp_path)
         else:
             raw_content = extract_markdown(tmp_path)
     except Exception as e:
-        os.unlink(tmp_path)
         raise HTTPException(status_code=500, detail=f"Extraction failed: {str(e)}")
     finally:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
+        if os.path.exists(tmp_dir):
+            os.rmdir(tmp_dir)
 
-    # Extract entities
     entities = extract_entities(raw_content)
-
-    # Extract relationships
     relationships = extract_relationships(raw_content, entities)
 
     doc = {
@@ -73,16 +92,25 @@ async def upload_document(file: UploadFile = File(...)):
     return doc
 
 
-@router.post("/repository")
-async def add_repository(body: dict):
-    repo_url = body.get("repository_url", "")
-    if not repo_url:
-        raise HTTPException(status_code=400, detail="repository_url is required")
+class RepositoryRequest(BaseModel):
+    repository_url: str
 
+    @field_validator("repository_url")
+    @classmethod
+    def validate_url(cls, v: str) -> str:
+        if not v.startswith(("http://", "https://")):
+            raise ValueError("URL must start with http:// or https://")
+        if "github.com" not in v and "gitlab.com" not in v and "bitbucket.org" not in v:
+            raise ValueError("Only GitHub, GitLab, and Bitbucket URLs are supported")
+        return v
+
+
+@router.post("/repository")
+async def add_repository(request: RepositoryRequest):
     doc_id = str(uuid4())
     documents_db[doc_id] = {
         "id": doc_id,
-        "title": repo_url.split("/")[-1],
+        "title": request.repository_url.split("/")[-1],
         "source_type": "repository",
         "status": "queued",
         "raw_content": None,

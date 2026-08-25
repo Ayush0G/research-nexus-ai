@@ -9,3 +9,4 @@ psycopg2-binary>=2.9.0
 python-multipart>=0.0.18
 pymupdf>=1.24.0
 markdown>=3.6
+slowapi>=0.1.9
